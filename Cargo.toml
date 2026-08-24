@@ -1,0 +1,35 @@
+[package]
+name = "way-netstack"
+version = "0.1.1"
+edition = "2024"
+description = "A lightweight, high-performance userspace TCP/IP networking stack in Rust"
+license = "MIT"
+
+[lib]
+name = "way_netstack"
+path = "src/lib.rs"
+
+[dependencies]
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "async",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "proto-ipv4-fragmentation",
+    "proto-ipv6-fragmentation",
+    "socket-tcp",
+    "socket-udp",
+    "log",
+] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "macros", "net", "signal"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+tun-rs = { version = "2.8", features = ["async"] }
+socket2 = { version = "0.6", features = ["all"] }
+net-route = "0.4"
+getifaddrs = "0.6"
