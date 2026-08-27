@@ -283,10 +283,10 @@ async fn build_rig() -> (
         .tcp_buffer_size(TCP_BUFFER_SIZE)
         .channel_capacity(CHANNEL_CAPACITY)
         .udp_buffer(UDP_BUFFER_SLOTS, UDP_BUFFER_SLOTS * 1400)
-        // RSS stress: hand freed pages back to the OS immediately so the
-        // `jemalloc_stats` prints track the working set, not decayed-but-held
-        // memory. (Both `0` = immediate release; omit to keep jemalloc's 10 s.)
-        .jemalloc_decay(Duration::from_millis(0), Duration::from_millis(0))
+        // RSS stress: return freed pages to the OS immediately so the
+        // `allocator_stats` prints track the working set, not decayed-but-held
+        // memory. (`ZERO` = immediate release; omit to keep mimalloc's 10 ms.)
+        .mimalloc_purge_delay(Duration::from_millis(0))
         .add_interface(
             InterfaceId::new(IF).unwrap(),
             InterfaceConfig::new(NETSTACK_IP.parse().unwrap(), NETSTACK_PREFIX),
@@ -367,21 +367,16 @@ fn ms_now() -> i64 {
 fn elapsed_ms(t0: i64) -> i64 {
     ms_now() - t0
 }
-/// Snapshot jemalloc's live allocation footprint (`stats.allocated` /
-/// `stats.resident`) via `tikv-jemalloc-ctl`. This lets the stress test
-/// report the actual RSS behaviour of the netstack's heap (the stack installs
-/// jemalloc as the global allocator) without needing root or a TUN device.
-/// `stats` may be unavailable if the allocator didn't build with them; any
-/// failure is silently skipped.
-fn jemalloc_stats(label: &str) {
-    use tikv_jemalloc_ctl::{epoch, stats};
-    let _ = epoch::advance();
-    let allocated = stats::allocated::read().unwrap_or(0);
-    let resident = stats::resident::read().unwrap_or(0);
+/// Snapshot mimalloc's live allocation footprint (`current_rss` / `peak_rss`)
+/// via `MiMalloc::process_info`. This lets the stress test report the actual
+/// RSS behaviour of the netstack's heap (the stack installs mimalloc as the
+/// global allocator) without needing root or a TUN device.
+fn allocator_stats(label: &str) {
+    let info = rustfs_mimalloc::MiMalloc::process_info();
     println!(
-        "  [jemalloc {label}] allocated {:.1} MiB, resident {:.1} MiB",
-        allocated as f64 / (1024.0 * 1024.0),
-        resident as f64 / (1024.0 * 1024.0)
+        "  [mimalloc {label}] current_rss {:.1} MiB, peak_rss {:.1} MiB",
+        info.current_rss as f64 / (1024.0 * 1024.0),
+        info.peak_rss as f64 / (1024.0 * 1024.0)
     );
 }
 
@@ -834,14 +829,14 @@ async fn main() -> io::Result<()> {
 
     let (_iface, sessions, peer) = build_rig().await;
     scenario_tcp_churn(sessions, peer.clone()).await;
-    jemalloc_stats("after TCP churn");
+    allocator_stats("after TCP churn");
 
     let (_iface, sessions, peer) = build_rig().await;
     all_ok = scenario_udp_storm(sessions, peer.clone()).await && all_ok;
 
     let (_iface, sessions, peer) = build_rig().await;
     scenario_udp_burst(sessions, peer.clone()).await;
-    jemalloc_stats("end of run");
+    allocator_stats("end of run");
 
     if all_ok {
         println!("=== all scenarios passed ===");

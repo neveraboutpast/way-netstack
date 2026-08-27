@@ -11,14 +11,14 @@ path = "src/lib.rs"
 
 [features]
 default = ["allocator"]
-# Enables tikv-jemallocator as the process-global allocator (plus the
-# tikv-jemalloc-ctl handles used to tune it at runtime). Disable via
-# `default-features = false` (e.g. WASM / no_std-adjacent targets).
-allocator = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Enables rustfs-mimalloc (mimalloc V3) as the process-global allocator.
+# Disable via `default-features = false` (e.g. WASM / no_std-adjacent
+# targets).
+allocator = ["dep:rustfs-mimalloc", "dep:rustfs-mimalloc-sys"]
 
 [dependencies]
-tikv-jemallocator = { version = "0.7", optional = true }
-tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
+rustfs-mimalloc = { path = ".vendor-docs/rustfs-mimalloc", optional = true }
+rustfs-mimalloc-sys = { version = "0.5.1", optional = true }
 smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "async",

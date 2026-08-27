@@ -40,19 +40,18 @@ pub struct NetstackConfig {
     pub udp_buffer_bytes: usize,
     /// Hard cap on netstack-allocated buffer bytes, or `None` for unlimited.
     pub max_buffer_bytes: Option<usize>,
-    /// jemalloc `arenas.dirty_decay_ms` (ms) or `None` to leave jemalloc's own
-    /// default (10 s before pages are returned to the OS). `0` releases freed
-    /// pages immediately at a slight alloc cost.
-    pub jemalloc_dirty_decay: Option<Duration>,
-    /// jemalloc `arenas.muzzy_decay_ms` (ms) or `None` for jemalloc's own
-    /// default (10 s). See `jemalloc_dirty_decay`.
-    pub jemalloc_muzzy_decay: Option<Duration>,
-    /// Enable jemalloc's background thread so decay runs on its own schedule
-    /// instead of waiting for a foreground allocation event. jemalloc default:
-    /// disabled.
-    pub jemalloc_background_thread: bool,
+    /// mimalloc `mi_option_purge_delay` (ms): how long freed pages are held
+    /// before purging/releasing them to the OS. `Duration::ZERO` releases freed
+    /// pages immediately (a slight alloc cost); larger amortises reuse across
+    /// bursts. `None` leaves mimalloc's own default (10 ms). Only applied when
+    /// the `allocator` feature is on.
+    pub mimalloc_purge_delay: Option<Duration>,
+    /// mimalloc `mi_option_allow_large_os_pages`: allocate pages in 2 MiB chunks
+    /// instead of 4 KiB. Lowers TLB pressure/faults for big heaps; can inflate
+    /// RSS. Default: `false` (mimalloc's own default).
+    pub mimalloc_large_os_pages: bool,
+    pub mimalloc_allow_thp: bool,
 }
-
 impl Default for NetstackConfig {
     fn default() -> Self {
         Self {
@@ -67,9 +66,9 @@ impl Default for NetstackConfig {
             udp_buffer_packets: 16,
             udp_buffer_bytes: 16 * 1024,
             max_buffer_bytes: None,
-            jemalloc_dirty_decay: None,
-            jemalloc_muzzy_decay: None,
-            jemalloc_background_thread: false,
+            mimalloc_purge_delay: None,
+            mimalloc_large_os_pages: false,
+            mimalloc_allow_thp: true,
         }
     }
 }
@@ -231,26 +230,28 @@ impl NetstackBuilder {
         self
     }
 
-    /// Tune how eagerly jemalloc returns freed pages to the OS
-    /// (`arenas.dirty_decay_ms` / `arenas.muzzy_decay_ms`): freed pages wait
-    /// this long before being recycled/released, so `0` frees them immediately
-    /// (a slight alloc cost) while a larger value amortises realloc across
-    /// bursts. Applied best-effort at `build()`; if jemalloc isn't the process
-    /// allocator the write is skipped. Default: `None` (leave jemalloc's own
-    /// default of 10 s).
-    pub fn jemalloc_decay(mut self, dirty: Duration, muzzy: Duration) -> Self {
-        self.config.jemalloc_dirty_decay = Some(dirty);
-        self.config.jemalloc_muzzy_decay = Some(muzzy);
+    /// Tune how eagerly mimalloc returns freed pages to the OS
+    /// (`mi_option_purge_delay`): freed pages are held this long before being
+    /// purged/released, so `Duration::ZERO` frees them immediately (slight alloc
+    /// cost) while a larger value amortises reuse across bursts. Applied
+    /// best-effort at `build()`; if mimalloc isn't the process allocator the
+    /// write is skipped. Default: `None` (mimalloc's own default of 10 ms).
+    pub fn mimalloc_purge_delay(mut self, delay: Duration) -> Self {
+        self.config.mimalloc_purge_delay = Some(delay);
         self
     }
 
-    /// Enable/disable jemalloc's background decay thread (`background_thread`),
-    /// so decay runs on its own schedule instead of waiting for a foreground
-    /// allocation event. Default: `false` (jemalloc's own default; for a
-    /// netstack, keep it off so a background thread never accumulates decay
-    /// worker threads).
-    pub fn jemalloc_background_thread(mut self, enabled: bool) -> Self {
-        self.config.jemalloc_background_thread = enabled;
+    /// Allow mimalloc to allocate large (2 MiB) OS pages
+    /// (`mi_option_allow_large_os_pages`). Default: `false`.
+    pub fn mimalloc_large_os_pages(mut self, enabled: bool) -> Self {
+        self.config.mimalloc_large_os_pages = enabled;
+        self
+    }
+
+    /// Permit Transparent Huge Pages for the heap (`mi_option_allow_thp`).
+    /// Default: `true`. Set `false` where THP is undesirable.
+    pub fn mimalloc_allow_thp(mut self, enabled: bool) -> Self {
+        self.config.mimalloc_allow_thp = enabled;
         self
     }
 
@@ -275,9 +276,9 @@ impl NetstackBuilder {
     /// receiver that yields packets produced by the stack.
     /// Must be called from within a Tokio runtime.
     pub async fn build(self) -> Result<(NetstackHandle, EgressReceiver), NetstackError> {
-        // Apply jemalloc tuning before allocating the runner's buffers so the
-        // build-time allocation burst already obeys the caller's decay policy.
-        apply_jemalloc_tuning(&self.config);
+        // Apply mimalloc tuning before allocating the runner's buffers so the
+        // build-time allocation burst already obeys the caller's policy.
+        apply_mimalloc_tuning(&self.config);
 
         let mut core = Core {
             slots: Vec::with_capacity(self.interfaces.len()),
@@ -306,54 +307,36 @@ impl NetstackBuilder {
     }
 }
 
-/// Apply the caller's jemalloc tuning at runtime via `tikv-jemalloc-ctl`,
-/// best-effort.
+/// Apply the caller's mimalloc tuning at runtime via
+/// `rustfs_mimalloc::MiMalloc::option_set`, best-effort.
 ///
-/// jemalloc is the process-global allocator only when the `allocator` feature
-/// is enabled; otherwise (or when `mallctl` is unavailable) every write fails
-/// and is silently skipped, so this is a strict no-op for non-jemalloc builds.
-/// `None` fields leave jemalloc's own defaults untouched.
+/// mimalloc is the process-global allocator only when the `allocator` feature
+/// is enabled; otherwise (or when a `mi_option_*` write is unavailable) every
+/// write is silently skipped, so this is a strict no-op for non-mimalloc
+/// builds. `None` fields leave mimalloc's own defaults untouched.
 #[cfg(feature = "allocator")]
-fn apply_jemalloc_tuning(cfg: &NetstackConfig) {
-    use tikv_jemalloc_ctl::{Access, AsName};
+fn apply_mimalloc_tuning(cfg: &NetstackConfig) {
+    use rustfs_mimalloc::MiMalloc;
+    use rustfs_mimalloc_sys::mi_option_t;
 
-    // Number of arenas the process already has (read once; it may grow as
-    // `build()` allocates, but captured count bounds the patch loop).
-    let narenas: u32 = b"arenas.narenas\0".name().read().unwrap_or(0);
-
-    // Same value as both the global default for *future* arenas
-    // (`arenas.dirty_decay_ms` / `arenas.muzzy_decay_ms`) and every *existing*
-    // arena (`arena.{i}.…_decay_ms`), so the tuning bites the heap the
-    // process already allocated rather than only new arenas.
-    for (decay, global, slot) in [
-        (
-            cfg.jemalloc_dirty_decay,
-            "arenas.dirty_decay_ms\0",
-            "dirty_decay_ms",
-        ),
-        (
-            cfg.jemalloc_muzzy_decay,
-            "arenas.muzzy_decay_ms\0",
-            "muzzy_decay_ms",
-        ),
-    ] {
-        let Some(ms) = decay else {
-            continue;
-        };
-        let val = ms.as_millis() as isize;
-        let _ = global.as_bytes().name().write(val);
-        for i in 1..=narenas {
-            let key = format!("arena.{i}.{slot}\0");
-            let _ = key.as_bytes().name().write(val);
-        }
+    if let Some(delay) = cfg.mimalloc_purge_delay {
+        MiMalloc::option_set(
+            mi_option_t::mi_option_purge_delay,
+            delay.as_millis() as rustfs_mimalloc_sys::c_long,
+        );
     }
-    if cfg.jemalloc_background_thread {
-        let _ = tikv_jemalloc_ctl::background_thread::write(true);
-    }
+    MiMalloc::option_set(
+        mi_option_t::mi_option_allow_large_os_pages,
+        cfg.mimalloc_large_os_pages as rustfs_mimalloc_sys::c_long,
+    );
+    MiMalloc::option_set(
+        mi_option_t::mi_option_allow_thp,
+        cfg.mimalloc_allow_thp as rustfs_mimalloc_sys::c_long,
+    );
 }
 
 #[cfg(not(feature = "allocator"))]
-fn apply_jemalloc_tuning(_cfg: &NetstackConfig) {}
+fn apply_mimalloc_tuning(_cfg: &NetstackConfig) {}
 
 /// Convert an interface spec into a fully wired `smoltcp` interface.
 fn build_interface(
