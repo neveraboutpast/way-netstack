@@ -38,8 +38,25 @@
 //! });
 //! # }
 //! ```
-
+//!
+//! # Memory
+//!
+//! With the default `allocator` feature the crate installs
+//! [`tikv-jemallocator`] as the process-global allocator. The library itself
+//! never sets `MALLOC_CONF`; RSS tuning is done per-stack at runtime via
+//! [`NetstackBuilder::jemalloc_decay`] and
+//! [`NetstackBuilder::jemalloc_background_thread`], or globally by the
+//! embedding process's `MALLOC_CONF`. For example, to return freed pages to
+//! the OS on a short horizon set `MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000"`
+//! (values of `0` mean immediate page release at slight alloc cost). The
+//! `allocator` feature is on by default; disable it with
+//! `default-features = false` (e.g. WASM / no_std-adjacent targets) — then the
+//! jemalloc builder methods become no-ops.
 #![forbid(unsafe_code)]
+
+#[cfg(feature = "allocator")]
+#[global_allocator]
+static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub mod builder;
 pub mod device;

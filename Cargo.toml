@@ -9,7 +9,16 @@ license = "MIT"
 name = "way_netstack"
 path = "src/lib.rs"
 
+[features]
+default = ["allocator"]
+# Enables tikv-jemallocator as the process-global allocator (plus the
+# tikv-jemalloc-ctl handles used to tune it at runtime). Disable via
+# `default-features = false` (e.g. WASM / no_std-adjacent targets).
+allocator = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
 [dependencies]
+tikv-jemallocator = { version = "0.7", optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "async",

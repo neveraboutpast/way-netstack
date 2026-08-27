@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
 use smoltcp::iface::{Interface, SocketSet};
+use smoltcp::socket::tcp;
 use tokio::sync::Notify;
 
 use crate::InterfaceId;
@@ -87,6 +88,10 @@ pub(crate) struct InterfaceSlot {
     pub(crate) iface: Interface,
     pub(crate) device: VirtualDevice,
     pub(crate) sockets: SocketSet<'static>,
+    /// Reclaimed idle TCP sockets awaiting reuse (buffers kept warm).
+    pub(crate) tcp_pool: std::collections::VecDeque<tcp::Socket<'static>>,
+    /// Max idle sockets retained in `tcp_pool` (0 disables pooling).
+    tcp_pool_max: usize,
     mtu: usize,
     tcp_buffer_size: usize,
 }
@@ -97,6 +102,7 @@ impl InterfaceSlot {
         iface: Interface,
         device: VirtualDevice,
         sockets: SocketSet<'static>,
+        tcp_pool_max: usize,
         mtu: usize,
         tcp_buffer_size: usize,
     ) -> Self {
@@ -105,6 +111,8 @@ impl InterfaceSlot {
             iface,
             device,
             sockets,
+            tcp_pool: std::collections::VecDeque::new(),
+            tcp_pool_max,
             mtu,
             tcp_buffer_size,
         }
@@ -116,5 +124,10 @@ impl InterfaceSlot {
 
     pub(crate) fn buffer_size(&self) -> usize {
         self.tcp_buffer_size
+    }
+
+    /// Max idle sockets this interface retains in its reuse pool (0 = none).
+    pub(crate) fn tcp_pool_max(&self) -> usize {
+        self.tcp_pool_max
     }
 }

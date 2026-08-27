@@ -92,7 +92,10 @@ struct TestDevice {
 
 impl TestDevice {
     fn new() -> Self {
-        Self { ingress: VecDeque::new(), egress: VecDeque::new() }
+        Self {
+            ingress: VecDeque::new(),
+            egress: VecDeque::new(),
+        }
     }
 
     fn drain_egress(&mut self) -> Vec<Bytes> {
@@ -186,10 +189,8 @@ impl Peer {
     }
 
     fn add_udp_client(&mut self) -> SocketHandle {
-        let rx =
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 1500]);
-        let tx =
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 1500]);
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 1500]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 1500]);
         self.sockets.add(udp::Socket::new(rx, tx))
     }
 
@@ -272,12 +273,20 @@ async fn shuttle(
 }
 
 /// Build the netstack under test plus the peer "application" + shuttle.
-async fn build_rig() -> (InterfaceId, mpsc::UnboundedReceiver<Session>, Arc<Mutex<Peer>>) {
+async fn build_rig() -> (
+    InterfaceId,
+    mpsc::UnboundedReceiver<Session>,
+    Arc<Mutex<Peer>>,
+) {
     let (stack, egress) = NetstackBuilder::new()
         // Stress: tall buffers so the stack never drops data under burst.
         .tcp_buffer_size(TCP_BUFFER_SIZE)
         .channel_capacity(CHANNEL_CAPACITY)
         .udp_buffer(UDP_BUFFER_SLOTS, UDP_BUFFER_SLOTS * 1400)
+        // RSS stress: hand freed pages back to the OS immediately so the
+        // `jemalloc_stats` prints track the working set, not decayed-but-held
+        // memory. (Both `0` = immediate release; omit to keep jemalloc's 10 s.)
+        .jemalloc_decay(Duration::from_millis(0), Duration::from_millis(0))
         .add_interface(
             InterfaceId::new(IF).unwrap(),
             InterfaceConfig::new(NETSTACK_IP.parse().unwrap(), NETSTACK_PREFIX),
@@ -325,12 +334,7 @@ async fn wait_peer(
 }
 
 /// Block until `data` is fully enqueued into the peer's TCP send buffer.
-async fn tcp_send(
-    peer: &Arc<Mutex<Peer>>,
-    handle: SocketHandle,
-    data: &[u8],
-    timeout_secs: u64,
-) {
+async fn tcp_send(peer: &Arc<Mutex<Peer>>, handle: SocketHandle, data: &[u8], timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut offset = 0usize;
     loop {
@@ -347,7 +351,10 @@ async fn tcp_send(
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("tcp_send: peer did not accept {} bytes within {timeout_secs}s", data.len());
+            panic!(
+                "tcp_send: peer did not accept {} bytes within {timeout_secs}s",
+                data.len()
+            );
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -359,6 +366,23 @@ fn ms_now() -> i64 {
 
 fn elapsed_ms(t0: i64) -> i64 {
     ms_now() - t0
+}
+/// Snapshot jemalloc's live allocation footprint (`stats.allocated` /
+/// `stats.resident`) via `tikv-jemalloc-ctl`. This lets the stress test
+/// report the actual RSS behaviour of the netstack's heap (the stack installs
+/// jemalloc as the global allocator) without needing root or a TUN device.
+/// `stats` may be unavailable if the allocator didn't build with them; any
+/// failure is silently skipped.
+fn jemalloc_stats(label: &str) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let _ = epoch::advance();
+    let allocated = stats::allocated::read().unwrap_or(0);
+    let resident = stats::resident::read().unwrap_or(0);
+    println!(
+        "  [jemalloc {label}] allocated {:.1} MiB, resident {:.1} MiB",
+        allocated as f64 / (1024.0 * 1024.0),
+        resident as f64 / (1024.0 * 1024.0)
+    );
 }
 
 // ── Echo relays (the interceptor side) ─────────────────────────────────────
@@ -420,7 +444,9 @@ async fn scenario_tcp_storm(
     for _ in 0..n {
         let session = wait_for(sessions.recv()).await;
         match session {
-            Session::Tcp(s) => { tokio::spawn(echo_tcp(s)); },
+            Session::Tcp(s) => {
+                tokio::spawn(echo_tcp(s));
+            }
             other => panic!("tcp storm: expected TCP session, got {other:?}"),
         }
     }
@@ -445,7 +471,11 @@ async fn scenario_tcp_storm(
             }
         })
         .await;
-        assert_eq!(&got[..], TCP_STORM_MARKER, "tcp storm marker mismatch on #{i}");
+        assert_eq!(
+            &got[..],
+            TCP_STORM_MARKER,
+            "tcp storm marker mismatch on #{i}"
+        );
         matched += 1;
     }
     println!(
@@ -472,7 +502,9 @@ async fn scenario_tcp_throughput(
 
     let session = wait_for(sessions.recv()).await;
     match session {
-        Session::Tcp(s) => { tokio::spawn(echo_tcp(s)); },
+        Session::Tcp(s) => {
+            tokio::spawn(echo_tcp(s));
+        }
         other => panic!("tcp throughput: expected TCP session, got {other:?}"),
     }
 
@@ -499,7 +531,11 @@ async fn scenario_tcp_throughput(
         // Send a slice (one attempt per loop; the rest drains below).
         if sent < total {
             let i = sent;
-            let want = if (i + CHUNK) > total { total - i } else { CHUNK };
+            let want = if (i + CHUNK) > total {
+                total - i
+            } else {
+                CHUNK
+            };
             let done = {
                 let mut g = peer.lock().unwrap();
                 let s = g.sockets.get_mut::<tcp::Socket>(handle);
@@ -511,7 +547,11 @@ async fn scenario_tcp_throughput(
             sent = sent + done;
             did_something = did_something || done > 0;
             if sent >= printed_mib + PROG_STEP {
-                println!("   progress: sent {} MiB, echoed {} MiB", sent / (1024 * 1024), received / (1024 * 1024));
+                println!(
+                    "   progress: sent {} MiB, echoed {} MiB",
+                    sent / (1024 * 1024),
+                    received / (1024 * 1024)
+                );
                 printed_mib += PROG_STEP;
             }
         }
@@ -539,9 +579,9 @@ async fn scenario_tcp_throughput(
     }
 
     let mut ms = elapsed_ms(t0);
-        if ms < 1 {
-            ms = 1;
-        }
+    if ms < 1 {
+        ms = 1;
+    }
     let mib_s = (((TCP_THROUGHPUT_MIB as u64) * 1000) / ms as u64) as usize;
     println!("  {TCP_THROUGHPUT_MIB} MiB echoed in {ms} ms = ~{mib_s} MiB/s");
 }
@@ -564,7 +604,9 @@ async fn scenario_tcp_churn(
         };
         let session = wait_for(sessions.recv()).await;
         match session {
-            Session::Tcp(s) => { tokio::spawn(echo_tcp(s)); },
+            Session::Tcp(s) => {
+                tokio::spawn(echo_tcp(s));
+            }
             other => panic!("tcp churn: expected TCP session, got {other:?}"),
         }
         wait_peer(10, &peer, |p| {
@@ -593,7 +635,10 @@ async fn scenario_tcp_churn(
             println!("   churn progress {i}...");
         }
     }
-    println!("  {ok}/{TCP_CHURN} cycles completed in {} ms", elapsed_ms(t0));
+    println!(
+        "  {ok}/{TCP_CHURN} cycles completed in {} ms",
+        elapsed_ms(t0)
+    );
 }
 
 /// N distinct UDP endpoints must surface as N sessions; every datagram echoed.
@@ -628,7 +673,9 @@ async fn scenario_udp_storm(
     for _ in 0..m {
         let session = wait_for(sessions.recv()).await;
         match session {
-            Session::Udp(s) => { tokio::spawn(echo_udp(s)); },
+            Session::Udp(s) => {
+                tokio::spawn(echo_udp(s));
+            }
             other => panic!("udp storm: expected UDP session, got {other:?}"),
         }
     }
@@ -648,7 +695,9 @@ async fn scenario_udp_storm(
                     Ok((payload, _meta)) => {
                         let same = payload.as_ref() == marker.as_ref();
                         if !same {
-                            panic!("udp storm: payload mismatch on #{i}: {payload:?} vs {marker:?}");
+                            panic!(
+                                "udp storm: payload mismatch on #{i}: {payload:?} vs {marker:?}"
+                            );
                         }
                         true
                     }
@@ -665,14 +714,25 @@ async fn scenario_udp_storm(
             matched += 1;
         } else {
             missed.push(i);
-            println!("   MISSED client #{i} (dst port {})", UDP_PORT_BASE + i as u16);
+            println!(
+                "   MISSED client #{i} (dst port {})",
+                UDP_PORT_BASE + i as u16
+            );
         }
     }
     if missed.len() > 0 {
-        println!("  WARNING: {}/{} UDP clients echoed, {} MISSED", matched, m, missed.len());
+        println!(
+            "  WARNING: {}/{} UDP clients echoed, {} MISSED",
+            matched,
+            m,
+            missed.len()
+        );
         println!("  (UDP is best-effort: replies were lost during the concurrent-session flood)");
     } else {
-        println!("  {matched}/{m} UDP sessions echoed in {} ms", elapsed_ms(t0));
+        println!(
+            "  {matched}/{m} UDP sessions echoed in {} ms",
+            elapsed_ms(t0)
+        );
     }
     missed.len() == 0
 }
@@ -691,10 +751,8 @@ async fn scenario_udp_burst(
         // Huge peer rx AND tx so the echo path never drops or stalls at the
         // client; the netstack's per-dst buffer (UDP_BUFFER_SLOTS) is what we
         // test.
-        let rx =
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; n], vec![0u8; n * 1400]);
-        let tx =
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; n], vec![0u8; n * 1400]);
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; n], vec![0u8; n * 1400]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; n], vec![0u8; n * 1400]);
         let h = g.sockets.add(udp::Socket::new(rx, tx));
         g.sockets
             .get_mut::<udp::Socket>(h)
@@ -705,12 +763,15 @@ async fn scenario_udp_burst(
     {
         let mut g = peer.lock().unwrap();
         let s = g.sockets.get_mut::<udp::Socket>(handle);
-        s.send_slice(UDP_BURST_MARKER, (PEER_IP, UDP_BURST_PORT)).unwrap();
+        s.send_slice(UDP_BURST_MARKER, (PEER_IP, UDP_BURST_PORT))
+            .unwrap();
     }
 
     let session = wait_for(sessions.recv()).await;
     match session {
-        Session::Udp(s) => { tokio::spawn(echo_udp(s)); },
+        Session::Udp(s) => {
+            tokio::spawn(echo_udp(s));
+        }
         other => panic!("udp burst: expected UDP session, got {other:?}"),
     }
 
@@ -720,7 +781,8 @@ async fn scenario_udp_burst(
         let ok_send = {
             let mut g = peer.lock().unwrap();
             let s = g.sockets.get_mut::<udp::Socket>(handle);
-            s.send_slice(UDP_BURST_MARKER, (PEER_IP, UDP_BURST_PORT)).is_ok()
+            s.send_slice(UDP_BURST_MARKER, (PEER_IP, UDP_BURST_PORT))
+                .is_ok()
         };
         if ok_send {
             sent += 1;
@@ -772,12 +834,14 @@ async fn main() -> io::Result<()> {
 
     let (_iface, sessions, peer) = build_rig().await;
     scenario_tcp_churn(sessions, peer.clone()).await;
+    jemalloc_stats("after TCP churn");
 
     let (_iface, sessions, peer) = build_rig().await;
     all_ok = scenario_udp_storm(sessions, peer.clone()).await && all_ok;
 
     let (_iface, sessions, peer) = build_rig().await;
     scenario_udp_burst(sessions, peer.clone()).await;
+    jemalloc_stats("end of run");
 
     if all_ok {
         println!("=== all scenarios passed ===");

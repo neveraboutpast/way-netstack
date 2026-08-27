@@ -194,6 +194,11 @@ async fn main() -> io::Result<()> {
         .log_level(way_netstack::LogLevel::Debug)
         .udp_buffer(16, 16 * 1024)
         .max_buffer_bytes(None)
+        // jemalloc RSS stretch: return freed pages to the OS after a short
+        // horizon (dirty 100 ms, muzzy immediately) instead of jemalloc's
+        // default 10 s — keeps a long-running proxy's resident set low. Omit
+        // to leave jemalloc's defaults untouched.
+        .jemalloc_decay(Duration::from_millis(100), Duration::from_millis(0))
         .add_interface(
             InterfaceId::new(0).unwrap(),
             InterfaceConfig::new(TUN_IP, TUN_PREFIX)

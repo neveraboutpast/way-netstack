@@ -33,11 +33,6 @@ impl VirtualDevice {
     pub(crate) fn push_ingress(&mut self, packet: Bytes) {
         self.ingress.push_back(packet);
     }
-
-    /// Drain every packet produced by `smoltcp` since the last poll.
-    pub(crate) fn drain_egress(&mut self) -> Vec<Bytes> {
-        self.egress.drain(..).collect()
-    }
 }
 
 /// Receive token: hands the raw IP packet bytes to the interface.

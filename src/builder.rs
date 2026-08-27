@@ -24,6 +24,8 @@ pub struct NetstackConfig {
     pub tcp_buffer_size: usize,
     /// Maximum number of simultaneous TCP sessions.
     pub tcp_max_connections: usize,
+    /// Max idle TCP sockets kept warm for reuse per interface, or 0 to disable.
+    pub tcp_pool_size: usize,
     /// Inactivity timeout after which a UDP session is reclaimed.
     pub udp_session_timeout: Duration,
     /// Maximum number of simultaneous UDP sessions.
@@ -38,6 +40,17 @@ pub struct NetstackConfig {
     pub udp_buffer_bytes: usize,
     /// Hard cap on netstack-allocated buffer bytes, or `None` for unlimited.
     pub max_buffer_bytes: Option<usize>,
+    /// jemalloc `arenas.dirty_decay_ms` (ms) or `None` to leave jemalloc's own
+    /// default (10 s before pages are returned to the OS). `0` releases freed
+    /// pages immediately at a slight alloc cost.
+    pub jemalloc_dirty_decay: Option<Duration>,
+    /// jemalloc `arenas.muzzy_decay_ms` (ms) or `None` for jemalloc's own
+    /// default (10 s). See `jemalloc_dirty_decay`.
+    pub jemalloc_muzzy_decay: Option<Duration>,
+    /// Enable jemalloc's background thread so decay runs on its own schedule
+    /// instead of waiting for a foreground allocation event. jemalloc default:
+    /// disabled.
+    pub jemalloc_background_thread: bool,
 }
 
 impl Default for NetstackConfig {
@@ -46,6 +59,7 @@ impl Default for NetstackConfig {
             mtu: 1500,
             tcp_buffer_size: 16 * 1024,
             tcp_max_connections: 4096,
+            tcp_pool_size: 4096,
             udp_session_timeout: Duration::from_secs(30),
             udp_max_sessions: 4096,
             channel_capacity: 2048,
@@ -53,6 +67,9 @@ impl Default for NetstackConfig {
             udp_buffer_packets: 16,
             udp_buffer_bytes: 16 * 1024,
             max_buffer_bytes: None,
+            jemalloc_dirty_decay: None,
+            jemalloc_muzzy_decay: None,
+            jemalloc_background_thread: false,
         }
     }
 }
@@ -156,6 +173,17 @@ impl NetstackBuilder {
         self
     }
 
+    /// How many closed TCP sockets to keep warm for reuse per interface.
+    ///
+    /// Reusing a reclaimed socket avoids re-`malloc`/`free`ing its two
+    /// buffers, at the cost of holding that RAM (bounded by this value)
+    /// resident even when idle. `0` disables pooling entirely — sockets are
+    /// freed as today. Default: 4096 (matching `tcp_max_connections`).
+    pub fn tcp_socket_pool(mut self, n: usize) -> Self {
+        self.config.tcp_pool_size = n;
+        self
+    }
+
     /// UDP session inactivity timeout: a session is reclaimed (and its stream
     /// ends) after this long with no traffic. Default: 30s.
     pub fn udp_session_timeout(mut self, timeout: Duration) -> Self {
@@ -203,6 +231,29 @@ impl NetstackBuilder {
         self
     }
 
+    /// Tune how eagerly jemalloc returns freed pages to the OS
+    /// (`arenas.dirty_decay_ms` / `arenas.muzzy_decay_ms`): freed pages wait
+    /// this long before being recycled/released, so `0` frees them immediately
+    /// (a slight alloc cost) while a larger value amortises realloc across
+    /// bursts. Applied best-effort at `build()`; if jemalloc isn't the process
+    /// allocator the write is skipped. Default: `None` (leave jemalloc's own
+    /// default of 10 s).
+    pub fn jemalloc_decay(mut self, dirty: Duration, muzzy: Duration) -> Self {
+        self.config.jemalloc_dirty_decay = Some(dirty);
+        self.config.jemalloc_muzzy_decay = Some(muzzy);
+        self
+    }
+
+    /// Enable/disable jemalloc's background decay thread (`background_thread`),
+    /// so decay runs on its own schedule instead of waiting for a foreground
+    /// allocation event. Default: `false` (jemalloc's own default; for a
+    /// netstack, keep it off so a background thread never accumulates decay
+    /// worker threads).
+    pub fn jemalloc_background_thread(mut self, enabled: bool) -> Self {
+        self.config.jemalloc_background_thread = enabled;
+        self
+    }
+
     /// Register a virtual interface with the stack.
     ///
     /// Returns an error if the interface identifier is already in use.
@@ -222,9 +273,12 @@ impl NetstackBuilder {
     ///
     /// Returns the handle used to inject packets and accept sessions, plus the
     /// receiver that yields packets produced by the stack.
-    ///
     /// Must be called from within a Tokio runtime.
     pub async fn build(self) -> Result<(NetstackHandle, EgressReceiver), NetstackError> {
+        // Apply jemalloc tuning before allocating the runner's buffers so the
+        // build-time allocation burst already obeys the caller's decay policy.
+        apply_jemalloc_tuning(&self.config);
+
         let mut core = Core {
             slots: Vec::with_capacity(self.interfaces.len()),
             manager: Default::default(),
@@ -251,6 +305,55 @@ impl NetstackBuilder {
         Ok((handle, egress_rx))
     }
 }
+
+/// Apply the caller's jemalloc tuning at runtime via `tikv-jemalloc-ctl`,
+/// best-effort.
+///
+/// jemalloc is the process-global allocator only when the `allocator` feature
+/// is enabled; otherwise (or when `mallctl` is unavailable) every write fails
+/// and is silently skipped, so this is a strict no-op for non-jemalloc builds.
+/// `None` fields leave jemalloc's own defaults untouched.
+#[cfg(feature = "allocator")]
+fn apply_jemalloc_tuning(cfg: &NetstackConfig) {
+    use tikv_jemalloc_ctl::{Access, AsName};
+
+    // Number of arenas the process already has (read once; it may grow as
+    // `build()` allocates, but captured count bounds the patch loop).
+    let narenas: u32 = b"arenas.narenas\0".name().read().unwrap_or(0);
+
+    // Same value as both the global default for *future* arenas
+    // (`arenas.dirty_decay_ms` / `arenas.muzzy_decay_ms`) and every *existing*
+    // arena (`arena.{i}.…_decay_ms`), so the tuning bites the heap the
+    // process already allocated rather than only new arenas.
+    for (decay, global, slot) in [
+        (
+            cfg.jemalloc_dirty_decay,
+            "arenas.dirty_decay_ms\0",
+            "dirty_decay_ms",
+        ),
+        (
+            cfg.jemalloc_muzzy_decay,
+            "arenas.muzzy_decay_ms\0",
+            "muzzy_decay_ms",
+        ),
+    ] {
+        let Some(ms) = decay else {
+            continue;
+        };
+        let val = ms.as_millis() as isize;
+        let _ = global.as_bytes().name().write(val);
+        for i in 1..=narenas {
+            let key = format!("arena.{i}.{slot}\0");
+            let _ = key.as_bytes().name().write(val);
+        }
+    }
+    if cfg.jemalloc_background_thread {
+        let _ = tikv_jemalloc_ctl::background_thread::write(true);
+    }
+}
+
+#[cfg(not(feature = "allocator"))]
+fn apply_jemalloc_tuning(_cfg: &NetstackConfig) {}
 
 /// Convert an interface spec into a fully wired `smoltcp` interface.
 fn build_interface(
@@ -312,6 +415,7 @@ fn build_interface(
         iface,
         device,
         smoltcp::iface::SocketSet::new(vec![]),
+        config.tcp_pool_size,
         config.mtu,
         config.tcp_buffer_size,
     ))
